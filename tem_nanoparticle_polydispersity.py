@@ -2,33 +2,35 @@
 """
 tem_nanoparticle_polydispersity.py
 
-Misura automaticamente il diametro di nanoparticelle sferiche in immagini TEM
-Bright Field (particelle impaccate/anche a contatto tra loro) e calcola le
-statistiche di polidispersita' (media, deviazione standard, CV%, PDI).
+Automatically measures the diameter of spherical nanoparticles in Bright
+Field TEM images (packed particles, possibly touching each other) and
+computes polydispersity statistics (mean, standard deviation, CV%, PDI).
 
 Pipeline:
-  1. Calibrazione px -> nm tramite la scale bar nera presente nell'immagine.
-  2. Sogliatura (Otsu) per separare le particelle (scure) dal background (chiaro).
-  3. Segmentazione watershed (basata sulla distance transform) per separare
-     le particelle che si toccano tra loro.
-  4. Misura di area/diametro equivalente/circolarita' per ogni particella,
-     con filtro dei frammenti troppo piccoli o poco circolari (rumore).
-  5. Calcolo statistiche di polidispersita' + istogramma + overlay di verifica.
+  1. Pixel -> nm calibration via the black scale bar present in the image.
+  2. Thresholding (Otsu) to separate particles (dark) from background (light).
+  3. Watershed segmentation (based on the distance transform) to separate
+     particles that are touching each other.
+  4. Measurement of area/equivalent diameter/circularity for each particle,
+     filtering out fragments that are too small or not circular enough
+     (noise).
+  5. Computation of polydispersity statistics + histogram + verification
+     overlay.
 
-Dipendenze:
+Dependencies:
     pip install opencv-python-headless numpy scipy scikit-image matplotlib
 
-Esempio d'uso da riga di comando:
-    python tem_nanoparticle_polydispersity.py immagine.jpg \
+Command-line usage example:
+    python tem_nanoparticle_polydispersity.py image.jpg \
         --scalebar-nm 200 \
         --scalebar-region 0.85 1.0 0.0 0.35 \
         --min-diam-px 25 \
-        --outdir risultati
+        --outdir results
 
-Esempio d'uso come libreria:
+Library usage example:
     from tem_nanoparticle_polydispersity import analyze_image
 
-    result = analyze_image("immagine.jpg", scalebar_nm=200)
+    result = analyze_image("image.jpg", scalebar_nm=200)
     print(result["stats"])
 """
 
@@ -44,39 +46,39 @@ from skimage.measure import regionprops
 
 
 # --------------------------------------------------------------------------
-# 1. Calibrazione della scale bar
+# 1. Scale bar calibration
 # --------------------------------------------------------------------------
 def calibrate_scalebar(gray_img, scalebar_nm=200.0, region=(0.85, 1.0, 0.0, 0.35),
                         dark_thresh=100, min_bar_px=30):
     """
-    Trova la lunghezza in pixel della scale bar (barra nera solida e
-    orizzontale) all'interno di una sotto-regione dell'immagine e calcola il
-    fattore di conversione nm/pixel.
+    Finds the length in pixels of the scale bar (solid, horizontal black
+    bar) within a sub-region of the image and computes the nm/pixel
+    conversion factor.
 
-    Parametri
-    ---------
+    Parameters
+    ----------
     gray_img : np.ndarray (2D, uint8)
-        Immagine in scala di grigi.
+        Grayscale image.
     scalebar_nm : float
-        Lunghezza reale della scale bar in nm (es. 200).
+        Real length of the scale bar in nm (e.g. 200).
     region : tuple(float, float, float, float)
-        Frazioni (row_start, row_end, col_start, col_end) della regione
-        dell'immagine in cui cercare la scale bar. Default: angolo in basso
-        a sinistra.
+        Fractions (row_start, row_end, col_start, col_end) of the image
+        region in which to search for the scale bar. Default: bottom-left
+        corner.
     dark_thresh : int
-        Soglia di intensita' sotto la quale un pixel e' considerato "nero"
-        (parte della scale bar).
+        Intensity threshold below which a pixel is considered "black"
+        (part of the scale bar).
     min_bar_px : int
-        Numero minimo di pixel scuri consecutivi in una riga perche' venga
-        considerata come riga della scale bar (evita di confondere il testo
-        "200 nm" con la barra).
+        Minimum number of consecutive dark pixels in a row for it to be
+        considered a scale bar row (avoids confusing the "200 nm" text
+        with the bar itself).
 
-    Ritorna
+    Returns
     -------
-    dict con:
+    dict with:
         nm_per_px : float
         bar_length_px : float
-        bar_bbox : (row, col_start, col_end) nelle coordinate dell'immagine originale
+        bar_bbox : (row, col_start, col_end) in the original image coordinates
     """
     h, w = gray_img.shape
     r0, r1, c0, c1 = region
@@ -91,9 +93,9 @@ def calibrate_scalebar(gray_img, scalebar_nm=200.0, region=(0.85, 1.0, 0.0, 0.35
         cols = np.where(dark_mask[row])[0]
         if len(cols) < min_bar_px:
             continue
-        # la barra e' un segmento continuo: prendo min/max e verifico che
-        # la maggior parte dei pixel nel range sia effettivamente scura
-        # (per escludere righe di testo, che sono piu' "sparse")
+        # the bar is a continuous segment: take min/max and check that
+        # most pixels in that range are actually dark
+        # (to exclude text rows, which are more "sparse")
         span = cols.max() - cols.min() + 1
         if span < min_bar_px:
             continue
@@ -103,8 +105,8 @@ def calibrate_scalebar(gray_img, scalebar_nm=200.0, region=(0.85, 1.0, 0.0, 0.35
 
     if best_row is None:
         raise RuntimeError(
-            "Scale bar non trovata automaticamente: prova a cambiare 'region' "
-            "o 'dark_thresh'."
+            "Scale bar not found automatically: try changing 'region' "
+            "or 'dark_thresh'."
         )
 
     bar_length_px = best_end - best_start + 1
@@ -118,30 +120,30 @@ def calibrate_scalebar(gray_img, scalebar_nm=200.0, region=(0.85, 1.0, 0.0, 0.35
 
 
 # --------------------------------------------------------------------------
-# 2-3. Segmentazione (Otsu) + separazione delle particelle a contatto (watershed)
+# 2-3. Segmentation (Otsu) + splitting touching particles (watershed)
 # --------------------------------------------------------------------------
 def segment_and_split_particles(gray_img, exclude_region=None, min_peak_distance=15):
     """
-    Segmenta le particelle scure su sfondo chiaro e separa quelle a contatto
-    tramite watershed basato sulla distance transform.
+    Segments dark particles on a light background and splits touching
+    particles using watershed based on the distance transform.
 
-    Parametri
-    ---------
+    Parameters
+    ----------
     gray_img : np.ndarray (2D, uint8)
-    exclude_region : tuple(float, float, float, float) opzionale
-        Regione (row_start, row_end, col_start, col_end), in frazioni, da
-        escludere dalla segmentazione (es. dove si trova la scale bar/testo),
-        impostata a colore di sfondo prima della sogliatura.
+    exclude_region : tuple(float, float, float, float), optional
+        Region (row_start, row_end, col_start, col_end), in fractions, to
+        exclude from segmentation (e.g. where the scale bar/text is
+        located), set to background color before thresholding.
     min_peak_distance : int
-        Distanza minima (in pixel) tra i massimi locali della distance
-        transform, usata come marker per il watershed. Va scelta in base al
-        raggio approssimativo delle particelle (piu' piccola se le
-        particelle sono piccole/ravvicinate).
+        Minimum distance (in pixels) between local maxima of the distance
+        transform, used as markers for the watershed. Should be chosen
+        based on the approximate particle radius (smaller if particles are
+        small/closely packed).
 
-    Ritorna
+    Returns
     -------
-    labels_ws : np.ndarray (2D, int) - etichette watershed (0 = background)
-    mask : np.ndarray (2D, bool) - maschera binaria delle particelle
+    labels_ws : np.ndarray (2D, int) - watershed labels (0 = background)
+    mask : np.ndarray (2D, bool) - binary mask of the particles
     """
     h, w = gray_img.shape
     work = gray_img.copy()
@@ -150,7 +152,7 @@ def segment_and_split_particles(gray_img, exclude_region=None, min_peak_distance
         r0, r1, c0, c1 = exclude_region
         r0, r1 = int(h * r0), int(h * r1)
         c0, c1 = int(w * c0), int(w * c1)
-        work[r0:r1, c0:c1] = 255  # forza a "sfondo chiaro"
+        work[r0:r1, c0:c1] = 255  # force to "light background"
 
     blur = cv2.GaussianBlur(work, (5, 5), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -172,17 +174,17 @@ def segment_and_split_particles(gray_img, exclude_region=None, min_peak_distance
 
 
 # --------------------------------------------------------------------------
-# 4. Misura delle particelle + filtro rumore
+# 4. Particle measurement + noise filtering
 # --------------------------------------------------------------------------
 def measure_particles(labels_ws, nm_per_px, min_diam_px=25, min_circularity=0.5):
     """
-    Calcola area, diametro equivalente e circolarita' di ogni regione
-    watershed e filtra le regioni troppo piccole o poco circolari (in
-    genere frammenti di rumore o artefatti ai bordi).
+    Computes area, equivalent diameter and circularity for each watershed
+    region and filters out regions that are too small or not circular
+    enough (typically noise fragments or edge artifacts).
 
-    Ritorna
+    Returns
     -------
-    list di dict, uno per particella accettata, con chiavi:
+    list of dict, one per accepted particle, with keys:
         label, area_px, eq_diam_px, eq_diam_nm, circularity, solidity, centroid
     """
     props = regionprops(labels_ws)
@@ -211,16 +213,15 @@ def measure_particles(labels_ws, nm_per_px, min_diam_px=25, min_circularity=0.5)
 
 
 # --------------------------------------------------------------------------
-# Statistiche di polidispersita'
+# Polydispersity statistics
 # --------------------------------------------------------------------------
 def polydispersity_stats(diam_nm):
     """
-    Calcola le statistiche di polidispersita' a partire da un array di
-    diametri (in nm).
+    Computes polydispersity statistics from an array of diameters (in nm).
 
-    PDI qui e' definito come (sigma/media)^2, la stessa convenzione usata
-    tipicamente in DLS. E' una metrica adimensionale: valori piu' bassi
-    indicano un campione piu' monodisperso (es. PDI < 0.05 - 0.1 in TEM).
+    PDI here is defined as (sigma/mean)^2, the same convention typically
+    used in DLS. It is a dimensionless metric: lower values indicate a
+    more monodisperse sample (e.g. PDI < 0.05 - 0.1 in TEM).
     """
     diam_nm = np.asarray(diam_nm)
     mean_d = diam_nm.mean()
@@ -238,7 +239,7 @@ def polydispersity_stats(diam_nm):
 
 
 # --------------------------------------------------------------------------
-# Visualizzazione
+# Visualization
 # --------------------------------------------------------------------------
 def draw_overlay(color_img, particles, out_path):
     overlay = color_img.copy()
@@ -251,7 +252,7 @@ def draw_overlay(color_img, particles, out_path):
     cv2.imwrite(out_path, overlay)
 
 
-def plot_histogram(diam_nm, stats, out_path, material="nanoparticelle"):
+def plot_histogram(diam_nm, stats, out_path, material="nanoparticles"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -259,12 +260,12 @@ def plot_histogram(diam_nm, stats, out_path, material="nanoparticelle"):
     plt.figure(figsize=(7, 5))
     plt.hist(diam_nm, bins=30, color="#4C72B0", edgecolor="white")
     plt.axvline(stats["mean_nm"], color="crimson", linestyle="--", linewidth=1.5,
-                label=f'Media = {stats["mean_nm"]:.2f} nm')
-    plt.xlabel("Diametro particella (nm)")
-    plt.ylabel("Conteggio")
+                label=f'Mean = {stats["mean_nm"]:.2f} nm')
+    plt.xlabel("Particle diameter (nm)")
+    plt.ylabel("Count")
     plt.title(
-        f'Distribuzione dimensionale {material} (N={stats["n"]})\n'
-        f'Dev.std = {stats["std_nm"]:.2f} nm, CV = {stats["cv_percent"]:.1f}%, '
+        f'Size distribution {material} (N={stats["n"]})\n'
+        f'Std dev = {stats["std_nm"]:.2f} nm, CV = {stats["cv_percent"]:.1f}%, '
         f'PDI = {stats["pdi"]:.4f}'
     )
     plt.legend()
@@ -274,20 +275,20 @@ def plot_histogram(diam_nm, stats, out_path, material="nanoparticelle"):
 
 
 # --------------------------------------------------------------------------
-# Pipeline completa
+# Full pipeline
 # --------------------------------------------------------------------------
 def analyze_image(image_path, scalebar_nm=200.0,
                    scalebar_region=(0.85, 1.0, 0.0, 0.35),
                    min_peak_distance=15, min_diam_px=25, min_circularity=0.5,
-                   material="nanoparticelle", outdir=None):
+                   material="nanoparticles", outdir=None):
     """
-    Esegue l'intera pipeline su un'immagine TEM e ritorna un dizionario con
-    calibrazione, lista particelle e statistiche. Se outdir e' specificato,
-    salva anche overlay.png e histogram.png.
+    Runs the entire pipeline on a TEM image and returns a dictionary with
+    calibration, particle list and statistics. If outdir is specified,
+    also saves overlay.png and histogram.png.
     """
     gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
-        raise FileNotFoundError(f"Impossibile aprire l'immagine: {image_path}")
+        raise FileNotFoundError(f"Could not open image: {image_path}")
 
     calib = calibrate_scalebar(gray, scalebar_nm=scalebar_nm, region=scalebar_region)
 
@@ -319,26 +320,26 @@ def analyze_image(image_path, scalebar_nm=200.0,
 # --------------------------------------------------------------------------
 def _parse_args():
     ap = argparse.ArgumentParser(
-        description="Misura la polidispersita' di nanoparticelle in immagini TEM Bright Field."
+        description="Measures the polydispersity of nanoparticles in Bright Field TEM images."
     )
-    ap.add_argument("image", help="Percorso dell'immagine TEM (es. jpg/png/tif)")
+    ap.add_argument("image", help="Path to the TEM image (e.g. jpg/png/tif)")
     ap.add_argument("--scalebar-nm", type=float, default=200.0,
-                     help="Lunghezza reale della scale bar in nm (default: 200)")
+                     help="Real length of the scale bar in nm (default: 200)")
     ap.add_argument("--scalebar-region", type=float, nargs=4,
                      default=(0.85, 1.0, 0.0, 0.35),
                      metavar=("ROW_START", "ROW_END", "COL_START", "COL_END"),
-                     help="Regione (frazioni 0-1) dove cercare la scale bar. "
-                          "Default: angolo in basso a sinistra.")
+                     help="Region (fractions 0-1) where to search for the scale bar. "
+                          "Default: bottom-left corner.")
     ap.add_argument("--min-peak-distance", type=int, default=15,
-                     help="Distanza minima tra centri particella per il watershed (px)")
+                     help="Minimum distance between particle centers for watershed (px)")
     ap.add_argument("--min-diam-px", type=float, default=25,
-                     help="Diametro minimo (px) per accettare una particella (filtro rumore)")
+                     help="Minimum diameter (px) to accept a particle (noise filter)")
     ap.add_argument("--min-circularity", type=float, default=0.5,
-                     help="Circolarita' minima (4*pi*area/perimetro^2) per accettare una particella")
-    ap.add_argument("--material", default="nanoparticelle",
-                     help="Nome del materiale, usato solo nel titolo del grafico (es. 'nanoparticelle di Sn')")
-    ap.add_argument("--outdir", default="risultati_TEM",
-                     help="Cartella di output per overlay.png e histogram.png")
+                     help="Minimum circularity (4*pi*area/perimeter^2) to accept a particle")
+    ap.add_argument("--material", default="nanoparticles",
+                     help="Material name, used only in the plot title (e.g. 'Sn nanoparticles')")
+    ap.add_argument("--outdir", default="results_TEM",
+                     help="Output folder for overlay.png and histogram.png")
     return ap.parse_args()
 
 
@@ -359,17 +360,17 @@ def main():
     stats = result["stats"]
 
     print("=" * 60)
-    print(f"Calibrazione: {calib['bar_length_px']:.1f} px = {args.scalebar_nm:.0f} nm "
+    print(f"Calibration: {calib['bar_length_px']:.1f} px = {args.scalebar_nm:.0f} nm "
           f"-> {calib['nm_per_px']:.4f} nm/px")
-    print(f"Particelle rilevate (dopo filtro rumore): {stats['n']}")
-    print(f"Diametro medio:     {stats['mean_nm']:.2f} nm")
-    print(f"Diametro mediano:   {stats['median_nm']:.2f} nm")
-    print(f"Deviazione std:     {stats['std_nm']:.2f} nm")
+    print(f"Particles detected (after noise filter): {stats['n']}")
+    print(f"Mean diameter:      {stats['mean_nm']:.2f} nm")
+    print(f"Median diameter:    {stats['median_nm']:.2f} nm")
+    print(f"Std deviation:      {stats['std_nm']:.2f} nm")
     print(f"CV (RSD):           {stats['cv_percent']:.2f} %")
-    print(f"PDI (sigma/media)^2:{stats['pdi']:.4f}")
+    print(f"PDI (sigma/mean)^2: {stats['pdi']:.4f}")
     print(f"Range:              {stats['min_nm']:.2f} - {stats['max_nm']:.2f} nm")
     print("=" * 60)
-    print(f"Risultati grafici salvati in: {args.outdir}/overlay.png, {args.outdir}/histogram.png")
+    print(f"Plot results saved in: {args.outdir}/overlay.png, {args.outdir}/histogram.png")
 
 
 if __name__ == "__main__":
