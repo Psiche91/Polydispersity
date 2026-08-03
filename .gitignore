@@ -1,0 +1,8 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Telegram bot: segreti, audio temporanei, log di laboratorio
+.env
+telegram_bot/tmp_audio/
+Synthesis_Log/
