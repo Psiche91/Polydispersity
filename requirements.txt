@@ -5,3 +5,5 @@ scikit-image
 matplotlib
 pandas
 hyperspy
+ipywidgets
+ipyfilechooser
